@@ -506,6 +506,7 @@ class EddyTap:
         self._filter_design = None
         self._tap_z_offset = config.getfloat('tap_z_offset', 0.)
         self._tap_threshold = config.getfloat('tap_threshold', 0., above=0.)
+        self._least_squares_cache = {}
         if self._tap_threshold:
             self._setup_tap()
     # Setup for "tap" probe request
@@ -561,12 +562,12 @@ class EddyTap:
                                       s.get_past_mcu_position(pos_time))
                     for s in kin.get_steppers()}
         return kin.calc_position(kin_spos)
-    def _calc_least_squares(self, samples, est_z_contact):
-        # XXX - this implementation is not efficient
+    def _build_ls_matrix(self, samples, est_z_contact):
+        # The function here is only a reference for the optimized version below
         len_samples = len(samples)
         eqs = [[0.] * 4 for i in range(len_samples)]
         ans = [[0.] for i in range(len_samples)]
-        for i, (sensor_freq, step_z) in enumerate(samples):
+        for i, (step_z, sensor_freq) in enumerate(samples):
             ans[i][0] = sensor_freq
             eq = eqs[i]
             eq[0] = 1.
@@ -581,6 +582,65 @@ class EddyTap:
         eqst = mathutil.mat_transp(eqs)
         eqst_eqs = mathutil.mat_mat_mul(eqst, eqs)
         eqst_ans = mathutil.mat_mat_mul(eqst, ans)
+        return eqst_eqs, eqst_ans
+    def _build_sums(self, samples, est_z_contact):
+        sum_le_z = sum_le_z2 = sum_le_z3 = sum_le_z4 = sum_le_freq_z = 0.
+        sum_le_freq_z2 = sum_gt_z = sum_gt_z2 = sum_gt_freq = sum_gt_freq_z = 0.
+        sum_freq = 0.
+        for z, freq in samples:
+            sum_freq += freq
+            if z > est_z_contact:
+                sum_gt_z += z
+                sum_gt_z2 += z**2
+                sum_gt_freq += freq
+                sum_gt_freq_z += freq*z
+                continue
+            sum_le_z += z
+            sum_le_z2 += z**2
+            sum_le_z3 += z**3
+            sum_le_z4 += z**4
+            sum_le_freq_z += freq*z
+            sum_le_freq_z2 += freq * z**2
+        return (sum_le_z, sum_le_z2, sum_le_z3, sum_le_z4, sum_le_freq_z,
+                sum_le_freq_z2, sum_gt_z, sum_gt_z2, sum_gt_freq, sum_gt_freq_z,
+                sum_freq)
+    def _build_ls_matrix_opt(self, samples, est_z_contact):
+        # This function is an optimized version of _build_ls_matrix()
+        pos = bisect.bisect(samples, (est_z_contact, sys.float_info.max))
+        # Check for previously calculated raw freq/z counters
+        sums = self._least_squares_cache.get(pos)
+        if sums is None:
+            sums = self._build_sums(samples, est_z_contact)
+            self._least_squares_cache[pos] = sums
+        (sum_le_z, sum_le_z2, sum_le_z3, sum_le_z4, sum_le_freq_z,
+         sum_le_freq_z2, sum_gt_z, sum_gt_z2, sum_gt_freq, sum_gt_freq_z,
+         sum_freq) = sums
+        num_samples = len(samples)
+        num_gt = len(samples) - pos
+        ezc = est_z_contact
+        ezc2 = ezc**2
+        ezc3 = ezc**3
+        ezc4 = ezc**4
+        # Build matrices for least squares evaluation
+        eqst_eqs = [[0.] * 4 for i in range(4)]
+        eqst_eqs[0][0] = num_samples
+        eqst_eqs[2][2] = sum_le_z2 + num_gt*ezc2
+        eqst_eqs[3][3] = sum_le_z4 + num_gt*ezc4
+        eqst_eqs[1][1] = sum_gt_z2 - 2*ezc*sum_gt_z + num_gt*ezc2
+        eqst_eqs[0][2] = eqst_eqs[2][0] = sum_le_z + num_gt*ezc
+        eqst_eqs[0][3] = eqst_eqs[3][0] = sum_le_z2 + num_gt*ezc2
+        eqst_eqs[0][1] = eqst_eqs[1][0] = sum_gt_z - num_gt*ezc
+        eqst_eqs[2][3] = eqst_eqs[3][2] = sum_le_z3 + num_gt*ezc3
+        eqst_eqs[2][1] = eqst_eqs[1][2] = ezc * eqst_eqs[0][1]
+        eqst_eqs[3][1] = eqst_eqs[1][3] = ezc2 * eqst_eqs[0][1]
+        eqst_ans = [[0.] for i in range(4)]
+        eqst_ans[0][0] = sum_freq
+        eqst_ans[2][0] = sum_le_freq_z + ezc*sum_gt_freq
+        eqst_ans[3][0] = sum_le_freq_z2 + ezc2 * sum_gt_freq
+        eqst_ans[1][0] = sum_gt_freq_z - ezc*sum_gt_freq
+        return eqst_eqs, eqst_ans
+    def _calc_least_squares(self, samples, est_z_contact):
+        eqst_eqs, eqst_ans = self._build_ls_matrix_opt(samples, est_z_contact)
         coeffs = mathutil.gaussian_solve(eqst_eqs, eqst_ans)
         if coeffs is None:
             return sys.float_info.max, [[0.]] * 4
@@ -598,14 +658,16 @@ class EddyTap:
     def _find_least_squares(self, data):
         #for d in data:
         #    logging.info("sample: freq=%.3f z=%.6f", d[0], d[1][2])
+        self._least_squares_cache.clear()
         # Change base of freq/z measurements to simplify calculations
         len_data = len(data)
         base_z = data[-1][1][2]
         base_freq = .5 * (data[0][0] + data[-1][0])
-        samples = [(d[0] - base_freq, base_z - d[1][2]) for d in data]
+        samples = [(base_z - d[1][2], d[0] - base_freq) for d in data]
+        samples.reverse()
         # Run least squares with various z values to reduce residual error
-        min_z = best_z = samples[-1][1]
-        max_z = samples[0][1]
+        min_z = best_z = samples[0][0]
+        max_z = samples[-1][0]
         best_err = sys.float_info.max
         best_coeffs = [0., 0., 0., 0.]
         while max_z - min_z > 0.000250:
