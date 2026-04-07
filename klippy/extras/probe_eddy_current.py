@@ -507,6 +507,7 @@ class EddyTap:
         self._tap_z_offset = config.getfloat('tap_z_offset', 0.)
         self._tap_threshold = config.getfloat('tap_threshold', 0., above=0.)
         self._least_squares_cache = {}
+        self._current_tap_threshold = 0.
         if self._tap_threshold:
             self._setup_tap()
     # Setup for "tap" probe request
@@ -536,6 +537,7 @@ class EddyTap:
                                        self._tap_threshold, above=0.)
         raw_threshold = convert_frequency(tap_threshold)
         self._trigger_analog.set_trigger('diff_peak_gt', raw_threshold)
+        self._current_tap_threshold = tap_threshold
     # Measurement analysis to determine "tap" position
     def _validate_samples_time(self, measures, start_time, end_time):
         cmderr = self._printer.command_error
@@ -699,17 +701,38 @@ class EddyTap:
                         base_freq + bc[0] + best_z*bc[2] + best_z*best_z*bc[3],
                         -bc[1], -(bc[2] + 2.*best_z*bc[3]), bc[3])
         #logging.info("probe_analysis: coeffs=%s", final_coeffs)
-        return final_coeffs[0]
-    def _analyze_pullback(self, measures, start_time, end_time):
+        return final_coeffs
+    def _analyze_pullback(self, measures, start_time, end_time, speed):
         reactor = self._printer.get_reactor()
         self._validate_samples_time(measures, start_time, end_time)
         # Correlate measurements to toolhead position at time of measurement
         data = [(sensor_freq, self._lookup_toolhead_pos(samp_time))
                 for samp_time, sensor_freq, sensor_z in measures]
         reactor.pause(0.)
+        min_z = data[0][1][2]
+        max_z = data[-1][1][2]
+        if max_z - min_z < 0.350:
+            raise self._printer.command_error(
+                "Unable to detect tap: insufficient lift (%.6f vs %.6f)"
+                % (max_z - min_z, 0.350))
         # Find best fit for extracted measurements
-        z_contact = self._find_least_squares(data)
+        coeffs = self._find_least_squares(data)
         reactor.pause(0.)
+        z_contact, freq_contact, depress_slope, slope, slope2 = coeffs
+        sps = self._sensor_helper.get_samples_per_second()
+        req_slope = self._current_tap_threshold * sps / speed
+        if depress_slope - slope < req_slope:
+            raise self._printer.command_error(
+                "Unable to detect tap: insufficient slope delta (%.6f vs %.6f)"
+                % (depress_slope - slope, req_slope))
+        if z_contact - min_z < 0.050:
+            raise self._printer.command_error(
+                "Unable to detect tap: insufficient depress (%.6f vs %.6f)"
+                % (z_contact - min_z, 0.050))
+        if z_contact - min_z > 0.250:
+            raise self._printer.command_error(
+                "Unable to detect tap: excessive depress (%.6f vs %.6f)"
+                % (z_contact - min_z, 0.250))
         # Report probe position
         trig_idx = len(data)-1
         while trig_idx > 0 and data[trig_idx-1][1][2] > z_contact:
@@ -743,7 +766,7 @@ class EddyTap:
         start_time = retract_start_time - 0.010
         end_time = retract_start_time + 0.150
         self._gather.add_probe_request(self._analyze_pullback, start_time,
-                                       end_time, start_time, end_time)
+                                       end_time, start_time, end_time, speed)
     def pull_probed_results(self):
         return self._gather.pull_probed()
     def end_probe_session(self):
